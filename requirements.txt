@@ -1,0 +1,8 @@
+gym
+pygame
+torch==1.6
+h5py
+matplotlib
+opencv-python
+moviepy
+scipy

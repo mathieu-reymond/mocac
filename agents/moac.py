@@ -1,0 +1,157 @@
+import numpy as np
+import torch
+from itertools import chain
+from agents.agent import NNAgent, Transition
+from wrappers.tensor import TensorWrapper
+
+
+class MOAC(NNAgent):
+
+    def __init__(self, env,
+                 policy=None,
+                 memory=None,
+                 actor=None,
+                 critic=None,
+                 utility=None,
+                 gamma=1.,
+                 n_steps_update=1,
+                 lr=1e-3,
+                 v_coef=0.5,
+                 e_coef=0.01,
+                 **nn_kwargs):
+
+        params = chain(actor.parameters(), critic.parameters())
+        # if actor and critic share layers, only insert them once in the optimizer
+        # do not use a set as it is unordered
+        params = list(dict.fromkeys(params))
+        optimizer = torch.optim.Adam(params, lr=lr)
+        super(MOAC, self).__init__(optimizer=optimizer, **nn_kwargs)
+        # tensor wrapper to make batches of steps, and convert np.arrays to tensors
+        env = TensorWrapper(env)
+        self.env = env
+        self.actor = actor
+        self.critic = critic
+        self.policy = policy
+        self.memory = memory
+
+        self.gamma = gamma
+        self.n_steps_update = n_steps_update
+        self.v_coef = v_coef
+        self.e_coef = e_coef
+
+        self.utility = utility
+        self.n_objectives = np.prod(self.env.reward_space.shape)
+        self.accrued = torch.tensor([]).view(0, self.n_objectives)
+        self.reset_obs = self.env.reset()
+
+    def start(self, log=None):
+        obs = self.env.reset()
+        return {'observation': obs,
+                'terminal': False}
+
+    def step(self, previous, log=None):
+        with torch.no_grad():
+            actor_out = self.actor(previous['observation'])
+            action = self.policy(actor_out, log=log)
+        # observations, actions are in batch, and tensor types for nn
+        next_obs, reward, terminal, _ = self.env.step(action)
+
+        gamma = torch.tensor([self.gamma**log.episode_step])
+        if log.episode_step == 0:
+            self.accrued = torch.cat((self.accrued[:-1], torch.zeros_like(reward), reward), dim=0)
+        else:
+            self.accrued = torch.cat((self.accrued, self.accrued[-1] + gamma*reward), dim=0)
+
+        t = Transition(observation=previous['observation'],
+                       action=action,
+                       reward=reward,
+                       next_observation=next_obs,
+                       terminal=terminal,
+                       gamma=gamma)
+
+        self.memory.add(t)
+
+        # update every n steps
+        # if ((log.episode_step + 1) % self.n_steps_update == 0) or terminal:
+        #     last = (log.episode_step%self.n_steps_update)+1 if terminal else self.n_steps_update
+        #     batch = self.memory.last(last)
+        if (log.total_steps + 1) % self.n_steps_update == 0:
+            accrued = self.accrued[:-1]
+            batch = self.memory.last(self.n_steps_update)
+            # get V(s) of all batch, need V(s') of last sample for n-step return
+            obs = torch.cat((batch.observation, batch.next_observation[-1:]), 0)
+            v_s_ns = self.critic(obs)
+            # detach() value of next state, to not propagate gradients from returns
+            v_s, v_ns = v_s_ns[:-1], v_s_ns[-1:].detach()
+            # rewards to discounted returns
+            returns = batch.reward.clone()
+            non_terminal = torch.logical_not(batch.terminal)
+            # add v of next-state if not terminal
+            returns[-1] += self.gamma * v_ns[-1] * non_terminal[-1]
+            for i in range(len(returns)-1, 0, -1):
+                # if episode ended in last n-steps, do not add to return
+                returns[i-1] += self.gamma * returns[i] * non_terminal[i-1]
+
+            # combine with accrued rewards
+            # with torch.no_grad():
+            # q_s = accrued + batch.gamma*returns
+            # v_s_acc = accrued + batch.gamma*v_s
+            # compute utilities
+            # u_q_s = self.utility(q_s)
+            # u_v_s = self.utility(v_s_acc)
+            # get reset Value
+            with torch.no_grad():
+                v_s_acc = v_s_0 = self.critic(self.reset_obs)
+            v_s_acc.requires_grad = True
+            # individual gradients wrt utility function
+            self.utility(v_s_acc).backward()
+
+            # advantage = u_q_s - u_v_s
+            advantage = returns-v_s
+            # get nllloss from actor
+            actor_out = self.actor(batch.observation)
+            log_prob = self.policy.log_prob(batch.action, actor_out)
+            # don't propagate gradients from advantage
+            actor_loss = -log_prob*advantage.detach()
+            # entropy
+            entropy = -torch.exp(log_prob) * log_prob
+            # mseloss for critic
+            critic_loss = advantage.pow(2)
+            # average over objectives
+            critic_loss = critic_loss.mean(-1, keepdims=True)
+
+            # SER policy gradient update
+            actor_loss = (actor_loss*v_s_acc.grad).sum(-1, keepdims=True)
+
+            loss = actor_loss + self.v_coef*critic_loss - self.e_coef*entropy
+            self.optimizer_step(loss)
+
+            self.accrued = self.accrued[-1:]
+
+        return {'observation': next_obs,
+                'action': action,
+                'reward': reward,
+                'terminal': terminal}
+
+
+    def evalstep(self, previous, log=None):
+        actor_out = self.actor(previous['observation'])
+        action = self.policy(actor_out, log=log)
+        next_obs, reward, terminal, info = self.env.step(action)
+        return {'observation': next_obs,
+                'action': action,
+                'reward': reward,
+                'terminal': terminal,
+                'env_info': info}
+
+    def state_dict(self):
+        return {'actor': self.actor.state_dict(),
+                'critic': self.critic.state_dict(),
+                'policy': self.policy,
+                'memory': self.memory}
+
+    def load_state_dict(self, sd):
+        self.actor.load_state_dict(sd['actor'])
+        self.critic.load_state_dict(sd['critic'])
+        self.policy = sd['policy']
+        self.memory = sd['memory']
